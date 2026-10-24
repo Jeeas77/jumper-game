@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Прыгун</title>
+<style>
+  body { margin: 0; background: #1e1e2e; display: flex; justify-content: center;
+         align-items: center; height: 100vh; touch-action: none; }
+  canvas { background: #bfeaf5; max-height: 100vh; max-width: 100vw; }
+</style>
+</head>
+<body>
+<canvas id="game" width="320" height="480"></canvas>
+
+<script>
+// ---------- 1. Настройки (их удобно менять и смотреть, что получится) ----------
+const TICKS_PER_SEC = 90;  // темп игры: сколько шагов в секунду (60 — как на обычном мониторе, больше — быстрее)
+const SLOW    = 0.7;        // общий «замедлитель»: 1 = как раньше, меньше = медленнее
+const SMOOTH  = 0.2;        // плавность поворотов: меньше = плавнее, 1 = резко
+const GRAVITY = 0.4 * SLOW * SLOW;  // как быстро игрок падает (в квадрате, чтобы высота прыжка не менялась)
+const JUMP    = -11 * SLOW;         // сила обычного прыжка (минус = вверх)
+const SPEED   = 6.5 * SLOW;         // скорость движения влево-вправо
+const PLAT_W  = 60;         // ширина платформы
+const PLAT_H  = 12;         // высота платформы
+
+const SPRING_JUMP   = -19 * SLOW;  // прыжок с пружины (почти вдвое сильнее обычного)
+const ROCKET_SPEED  = -15 * SLOW;  // скорость полёта с ракетой
+const ROCKET_FRAMES = Math.round(90 / SLOW);  // сколько кадров длится полёт (~1,5 секунды)
+const SPRING_CHANCE = 0.12; // шанс, что на новой платформе будет пружина
+const ROCKET_CHANCE = 0.015; // шанс ракеты (она очень редкая)
+const SHIELD_CHANCE = 0.02; // шанс щита
+const FLASH_FRAMES  = 20;   // длительность вспышки при разрушении щита
+const ENEMY_CHANCE  = 0.12; // шанс врага между платформами
+const ENEMY_SPEED   = 1.8 * SLOW;  // скорость полёта врага
+const ENEMY_FROM    = 300;  // с какого счёта появляются враги
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+// ---------- Сохранение (рекорд и выбранные цвета остаются в браузере) ----------
+function load(key) { try { return localStorage.getItem("jumper_" + key); } catch (e) { return null; } }
+function save(key, val) { try { localStorage.setItem("jumper_" + key, val); } catch (e) {} }
+
+// ---------- Цвета ----------
+// Порядок: от самых любимых в мире к редким. По опросу YouGov (10 стран, 4 континента)
+// синий — любимый цвет №1 везде, дальше чаще всего зелёный, красный и фиолетовый.
+// Первые три открыты сразу, остальные открываются рекордом (поле unlock = нужный счёт).
+const COLORS = [
+  { name: "Синий",      hex: "#2f6fed", unlock: 0 },
+  { name: "Зелёный",    hex: "#3aa655", unlock: 0 },
+  { name: "Красный",    hex: "#e63946", unlock: 0 },
+  { name: "Фиолетовый", hex: "#8e44ad", unlock: 500 },
+  { name: "Розовый",    hex: "#ff7eb6", unlock: 1000 },
+  { name: "Оранжевый",  hex: "#f28c28", unlock: 2000 },
+  { name: "Жёлтый",     hex: "#ffd23f", unlock: 3500 },
+  { name: "Чёрный",     hex: "#222222", unlock: 5000 },
+];
+
+let best = Number(load("best")) || 0;                    // лучший счёт за всё время
+let charIdx = load("char") === null ? 0 : Number(load("char"));  // цвет персонажа (по умолчанию синий)
+let platIdx = load("plat") === null ? 1 : Number(load("plat"));  // цвет платформ (по умолчанию зелёный)
+if (!(charIdx >= 0 && charIdx < COLORS.length) || best < COLORS[charIdx].unlock) charIdx = 0;
+if (!(platIdx >= 0 && platIdx < COLORS.length) || best < COLORS[platIdx].unlock) platIdx = 1;
+
+let state = "menu";                                      // "menu" — выбор цвета, "play" — игра
+let menuHint = "";                                       // подсказка про закрытые цвета
+let newColors = [];                                      // какие цвета открылись после игры
+
+// Тёмный цвет — белые глаза, светлый — чёрные
+function eyeColor(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const lum = 0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
+  return lum < 140 ? "#fff" : "#000";
+}
+
+// ---------- 2. Состояние игры ----------
+let player, platforms, enemies, score, gameOver, rocketLeft;
+let hasShield, flash;       // есть ли щит; сколько кадров ещё идёт вспышка
+let dir = 0;                // -1 влево, 0 стоим, 1 вправо
+
+function reset() {
+  player = { x: W / 2 - 15, y: H - 100, w: 30, h: 30, vx: 0, vy: 0 };
+  platforms = [{ x: W / 2 - PLAT_W / 2, y: H - 60, item: null }];  // стартовая платформа
+  enemies = [];
+  rocketLeft = 0;           // сколько кадров ещё летим на ракете
+  hasShield = false;
+  flash = 0;
+  newColors = [];
+  score = 0;
+  gameOver = false;
+  fillPlatforms();
+}
+
+// Прямоугольник бонуса на платформе (пружина или ракета лежат сверху)
+function itemRect(p) {
+  const it = p.item;
+  return { x: p.x + it.dx, y: p.y - it.h, w: it.w, h: it.h };
+}
+
+// Пересекаются ли два прямоугольника
+function hit(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Добавляем платформы вверх, пока не заполним экран
+function fillPlatforms() {
+  let topY = Math.min(...platforms.map(p => p.y));
+  while (topY > -20) {
+    topY -= 60 + Math.random() * 40;                     // расстояние 60–100 пикселей
+    const p = { x: Math.random() * (W - PLAT_W), y: topY, item: null };
+
+    // Случайно кладём на платформу бонус
+    const r = Math.random();
+    if (r < SPRING_CHANCE) {
+      p.item = { type: "spring", w: 16, h: 10 };
+    } else if (r < SPRING_CHANCE + ROCKET_CHANCE) {
+      p.item = { type: "rocket", w: 18, h: 28 };
+    } else if (r < SPRING_CHANCE + ROCKET_CHANCE + SHIELD_CHANCE) {
+      p.item = { type: "shield", w: 18, h: 18 };
+    }
+    if (p.item) p.item.dx = 4 + Math.random() * (PLAT_W - p.item.w - 8);
+    platforms.push(p);
+
+    // Иногда между платформами появляется летающий враг
+    if (score > ENEMY_FROM && Math.random() < ENEMY_CHANCE) {
+      enemies.push({
+        x: Math.random() * (W - 22), y: topY + 16, w: 22, h: 18,
+        vx: Math.random() < 0.5 ? -ENEMY_SPEED : ENEMY_SPEED
+      });
+    }
+  }
+}
+
+// Щит ломается: вспышка, и все враги на экране исчезают
+function breakShield() {
+  hasShield = false;
+  flash = FLASH_FRAMES;
+  enemies = enemies.filter(e => e.y + e.h <= 0);         // остаются только те, что ещё выше экрана
+}
+
+function endGame() {
+  gameOver = true;
+  const oldBest = best;
+  best = Math.max(best, Math.floor(score));
+  save("best", best);
+  // Какие цвета открылись благодаря этому рекорду
+  newColors = COLORS.filter(c => c.unlock > oldBest && c.unlock <= best).map(c => c.name);
+}
+
+function startGame() {
+  reset();
+  dir = 0;
+  state = "play";
+}
+
+// ---------- 3. Управление ----------
+const keys = {};
+addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (state === "menu" && (e.key === " " || e.key === "Enter")) startGame();
+  else if (state === "play" && gameOver && e.key === " ") state = "menu";
+});
+addEventListener("keyup", e => { keys[e.key] = false; });
+
+// Касание/мышь: левая половина экрана — влево, правая — вправо
+function pointerDir(e) {
+  const r = canvas.getBoundingClientRect();
+  return (e.clientX - r.left) < r.width / 2 ? -1 : 1;
+}
+canvas.addEventListener("pointerdown", e => {
+  if (state === "menu") { menuClick(e); return; }
+  if (gameOver) { state = "menu"; return; }
+  dir = pointerDir(e);
+});
+canvas.addEventListener("pointermove", e => { if (dir !== 0) dir = pointerDir(e); });
+addEventListener("pointerup", () => { dir = 0; });
+
+// ---------- 4. Обновление (вызывается ~60 раз в секунду) ----------
+function update() {
+  if (gameOver) return;
+  if (flash > 0) flash--;
+
+  // Движение по горизонтали
+  let move = dir;
+  if (keys["ArrowLeft"]  || keys["a"]) move = -1;
+  if (keys["ArrowRight"] || keys["d"]) move = 1;
+  // Скорость по горизонтали меняется плавно, а не мгновенно
+  player.vx += (move * SPEED - player.vx) * SMOOTH;
+  player.x += player.vx;
+  // Выход за край экрана — появляемся с другой стороны
+  if (player.x > W) player.x = -player.w;
+  if (player.x + player.w < 0) player.x = W;
+
+  // Вертикальное движение: с ракетой летим вверх, без неё действует гравитация
+  const prevBottom = player.y + player.h;
+  if (rocketLeft > 0) {
+    rocketLeft--;
+    player.vy = ROCKET_SPEED;
+  } else {
+    player.vy += GRAVITY;
+  }
+  player.y += player.vy;
+
+  // Враги летают из стороны в сторону и разворачиваются у краёв
+  for (const e of enemies) {
+    e.x += e.vx;
+    if (e.x < 0 || e.x + e.w > W) e.vx *= -1;
+  }
+
+  // Подбор бонусов: ракета и щит подбираются касанием
+  for (const p of platforms) {
+    if (!p.item || !hit(player, itemRect(p))) continue;
+    if (p.item.type === "rocket" && rocketLeft === 0) {
+      rocketLeft = ROCKET_FRAMES;
+      p.item = null;                                     // бонус исчезает с платформы
+    } else if (p.item.type === "shield") {
+      hasShield = true;
+      p.item = null;
+    }
+  }
+
+  // Столкновения с врагами
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (!hit(player, e)) continue;
+    if (rocketLeft > 0) {
+      enemies.splice(i, 1);                              // ракета сбивает врагов
+    } else if (player.vy > 0 && prevBottom <= e.y + 8) {
+      enemies.splice(i, 1);                              // прыгнули сверху — враг побеждён
+      player.vy = JUMP;
+    } else if (hasShield) {
+      breakShield();                                     // щит принял удар и разрушился
+      break;
+    } else {
+      endGame();                                         // коснулись сбоку или снизу
+      return;
+    }
+  }
+
+  // Приземление на платформу (только когда падаем и пересекли её сверху)
+  if (player.vy > 0) {
+    const bottom = player.y + player.h;
+    for (const p of platforms) {
+      const overlapX = player.x + player.w > p.x && player.x < p.x + PLAT_W;
+      if (overlapX && prevBottom <= p.y && bottom >= p.y) {
+        player.vy = JUMP;
+        // Если на платформе пружина и мы над ней — прыгаем сильнее
+        if (p.item && p.item.type === "spring") {
+          const s = itemRect(p);
+          if (player.x + player.w > s.x && player.x < s.x + s.w) player.vy = SPRING_JUMP;
+        }
+        break;
+      }
+    }
+  }
+
+  // Камера: если игрок выше середины экрана, сдвигаем весь мир вниз
+  if (player.y < H / 2) {
+    const shift = H / 2 - player.y;
+    player.y += shift;
+    platforms.forEach(p => p.y += shift);
+    enemies.forEach(e => e.y += shift);
+    score += shift;
+    platforms = platforms.filter(p => p.y < H + 20);     // убираем ушедшее вниз
+    enemies = enemies.filter(e => e.y < H + 20);
+    fillPlatforms();
+  }
+
+  // Проигрыш: упали ниже экрана
+  if (player.y > H) {
+    if (hasShield) {
+      breakShield();                                     // щит спасает от падения
+      player.y = H - player.h;
+      player.vy = SPRING_JUMP;                           // и подбрасывает вверх
+    } else {
+      endGame();
+    }
+  }
+}
+
+// ---------- 5. Отрисовка ----------
+function drawSpring(r) {
+  ctx.fillStyle = "#777";                                // основание
+  ctx.fillRect(r.x, r.y + r.h - 3, r.w, 3);
+  ctx.fillStyle = "#e63946";                             // красная пружина
+  ctx.fillRect(r.x + 2, r.y, r.w - 4, r.h - 3);
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(r.x + 2, r.y + 3, r.w - 4, 1);
+  ctx.fillRect(r.x + 2, r.y + 6, r.w - 4, 1);
+}
+
+function drawRocket(r) {
+  ctx.fillStyle = "#d9d9d9";                             // корпус
+  ctx.fillRect(r.x + 3, r.y + 6, r.w - 6, r.h - 10);
+  ctx.fillStyle = "#e63946";                             // нос
+  ctx.beginPath();
+  ctx.moveTo(r.x + 3, r.y + 6);
+  ctx.lineTo(r.x + r.w / 2, r.y);
+  ctx.lineTo(r.x + r.w - 3, r.y + 6);
+  ctx.fill();
+  ctx.fillRect(r.x, r.y + r.h - 10, 4, 8);               // боковые стабилизаторы
+  ctx.fillRect(r.x + r.w - 4, r.y + r.h - 10, 4, 8);
+  ctx.fillStyle = "#4cc9f0";                             // иллюминатор
+  ctx.fillRect(r.x + r.w / 2 - 2, r.y + 11, 4, 4);
+}
+
+function drawShield(r) {
+  ctx.fillStyle = "#4cc9f0";
+  ctx.strokeStyle = "#1d70a2";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(r.x + r.w / 2, r.y + r.h / 2, r.w / 2 - 1, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#fff";                                // блик
+  ctx.fillRect(r.x + 5, r.y + 4, 3, 5);
+}
+
+function drawEnemy(e) {
+  ctx.fillStyle = "#7b2cbf";
+  ctx.fillRect(e.x, e.y, e.w, e.h);
+  ctx.fillRect(e.x - 4, e.y + 3, 4, 6);                  // «крылья»
+  ctx.fillRect(e.x + e.w, e.y + 3, 4, 6);
+  ctx.fillStyle = "#fff";                                // глаза
+  ctx.fillRect(e.x + 4, e.y + 5, 5, 5);
+  ctx.fillRect(e.x + 13, e.y + 5, 5, 5);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(e.x + 6, e.y + 7, 2, 3);
+  ctx.fillRect(e.x + 14, e.y + 7, 2, 3);
+}
+
+function drawGame() {
+  ctx.clearRect(0, 0, W, H);
+
+  for (const p of platforms) {
+    ctx.fillStyle = COLORS[platIdx].hex;                 // платформа выбранного цвета
+    ctx.fillRect(p.x, p.y, PLAT_W, PLAT_H);
+    ctx.strokeStyle = "rgba(0,0,0,0.35)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(p.x + 0.5, p.y + 0.5, PLAT_W - 1, PLAT_H - 1);
+    if (p.item) {
+      const r = itemRect(p);
+      if (p.item.type === "spring") drawSpring(r);
+      else if (p.item.type === "rocket") drawRocket(r);
+      else drawShield(r);
+    }
+  }
+
+  enemies.forEach(drawEnemy);
+
+  if (rocketLeft > 0) {                                  // пламя под игроком
+    ctx.fillStyle = "#ff9f1c";
+    ctx.beginPath();
+    ctx.moveTo(player.x + 6, player.y + player.h);
+    ctx.lineTo(player.x + player.w / 2, player.y + player.h + 14 + Math.random() * 10);
+    ctx.lineTo(player.x + player.w - 6, player.y + player.h);
+    ctx.fill();
+  }
+  ctx.fillStyle = COLORS[charIdx].hex;                   // игрок выбранного цвета
+  ctx.fillRect(player.x, player.y, player.w, player.h);
+  ctx.strokeStyle = "rgba(0,0,0,0.35)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(player.x + 0.5, player.y + 0.5, player.w - 1, player.h - 1);
+  ctx.fillStyle = eyeColor(COLORS[charIdx].hex);         // глаза
+  ctx.fillRect(player.x + 7, player.y + 9, 4, 4);
+  ctx.fillRect(player.x + 19, player.y + 9, 4, 4);
+
+  if (hasShield) {                                       // пузырь щита вокруг игрока
+    ctx.fillStyle = "rgba(76,201,240,0.25)";
+    ctx.strokeStyle = "#4cc9f0";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(player.x + player.w / 2, player.y + player.h / 2, 25, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  if (flash > 0) {                                       // вспышка при разрушении щита
+    const k = flash / FLASH_FRAMES;
+    ctx.fillStyle = "rgba(255,255,255," + (0.5 * k) + ")";
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = "rgba(76,201,240," + k + ")";
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(player.x + player.w / 2, player.y + player.h / 2, 25 + (1 - k) * 250, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "#222";
+  ctx.font = "16px sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("Счёт: " + Math.floor(score), 10, 22);
+  if (hasShield) ctx.fillText("Щит", 10, 42);
+  if (rocketLeft > 0) {
+    ctx.textAlign = "right";
+    ctx.fillText("РАКЕТА!", W - 10, 22);
+  }
+
+  if (gameOver) {
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "28px sans-serif";
+    ctx.fillText("Игра окончена", W / 2, H / 2 - 20);
+    ctx.font = "16px sans-serif";
+    ctx.fillText("Счёт: " + Math.floor(score) + "   Рекорд: " + best, W / 2, H / 2 + 12);
+    if (newColors.length) {
+      ctx.fillStyle = "#ffd23f";
+      ctx.fillText("Открыт цвет: " + newColors.join(", "), W / 2, H / 2 + 44);
+      ctx.fillStyle = "#fff";
+    }
+    ctx.fillText("Коснитесь экрана или нажмите пробел", W / 2, H / 2 + 76);
+  }
+}
+
+// ---------- Меню выбора цветов ----------
+const SW = 44, GAP = 14, COLS = 4;                       // размер квадратика, отступ, колонок в ряду
+const GRID_X = (W - (COLS * SW + (COLS - 1) * GAP)) / 2;
+const CHAR_Y = 126, PLAT_Y = 272;                        // где начинаются ряды цветов
+const BTN = { x: 60, y: 402, w: 200, h: 46 };            // кнопка «Играть»
+
+function swatchRect(baseY, i) {
+  return {
+    x: GRID_X + (i % COLS) * (SW + GAP),
+    y: baseY + Math.floor(i / COLS) * (SW + GAP)
+  };
+}
+
+function drawSwatches(label, labelY, baseY, selected) {
+  ctx.fillStyle = "#222";
+  ctx.font = "16px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(label, W / 2, labelY);
+  COLORS.forEach((c, i) => {
+    const r = swatchRect(baseY, i);
+    const open = best >= c.unlock;
+    ctx.fillStyle = open ? c.hex : "#9aa3ad";            // закрытые цвета скрыты серым
+    ctx.fillRect(r.x, r.y, SW, SW);
+    ctx.strokeStyle = "rgba(0,0,0,0.35)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, SW - 1, SW - 1);
+    if (!open) {
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 20px sans-serif";
+      ctx.fillText("?", r.x + SW / 2, r.y + 24);
+      ctx.font = "11px sans-serif";
+      ctx.fillText(c.unlock, r.x + SW / 2, r.y + 39);    // сколько очков нужно
+    }
+    if (i === selected) {
+      ctx.strokeStyle = "#222";
+      ctx.lineWidth = 3;
+      ctx.strokeRect(r.x - 3, r.y - 3, SW + 6, SW + 6);
+    }
+  });
+}
+
+function drawMenu() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#222";
+  ctx.textAlign = "center";
+  ctx.font = "bold 30px sans-serif";
+  ctx.fillText("Прыгун", W / 2, 50);
+  ctx.font = "16px sans-serif";
+  ctx.fillText("Рекорд: " + best, W / 2, 78);
+
+  drawSwatches("Персонаж: " + COLORS[charIdx].name, 114, CHAR_Y, charIdx);
+  drawSwatches("Платформы: " + COLORS[platIdx].name, 260, PLAT_Y, platIdx);
+
+  ctx.fillStyle = "#b5271f";
+  ctx.font = "13px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(menuHint, W / 2, 392);
+
+  ctx.fillStyle = "#3aa655";
+  ctx.fillRect(BTN.x, BTN.y, BTN.w, BTN.h);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 22px sans-serif";
+  ctx.fillText("Играть", W / 2, BTN.y + 31);
+
+  ctx.fillStyle = "#555";
+  ctx.font = "12px sans-serif";
+  ctx.fillText("Управление: стрелки или касание левой/правой половины", W / 2, 470);
+}
+
+function menuClick(e) {
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * W / r.width;          // переводим клик в координаты холста
+  const y = (e.clientY - r.top) * H / r.height;
+
+  for (let i = 0; i < COLORS.length; i++) {
+    for (const row of ["char", "plat"]) {
+      const s = swatchRect(row === "char" ? CHAR_Y : PLAT_Y, i);
+      if (x < s.x || x > s.x + SW || y < s.y || y > s.y + SW) continue;
+      if (best < COLORS[i].unlock) {
+        menuHint = "Откроется при рекорде " + COLORS[i].unlock;
+      } else {
+        menuHint = "";
+        if (row === "char") { charIdx = i; save("char", i); }
+        else { platIdx = i; save("plat", i); }
+      }
+      return;
+    }
+  }
+  if (x >= BTN.x && x <= BTN.x + BTN.w && y >= BTN.y && y <= BTN.y + BTN.h) startGame();
+}
+
+// ---------- 6. Игровой цикл ----------
+// Логика идёт TICKS_PER_SEC шагов в секунду независимо от частоты экрана (60/120/144 Гц),
+// поэтому скорость игры одинакова на любом мониторе.
+const STEP = 1000 / TICKS_PER_SEC;
+let lastTime = 0, acc = 0;
+
+function loop(now) {
+  if (!lastTime) lastTime = now;
+  acc += Math.min(now - lastTime, 100);                  // не больше 100 мс за раз (например, после сворачивания вкладки)
+  lastTime = now;
+  while (acc >= STEP - 2) {                              // небольшой допуск, чтобы не было подёргиваний
+    if (state === "play") update();
+    acc -= STEP;
+  }
+  if (state === "menu") drawMenu(); else drawGame();
+  requestAnimationFrame(loop);
+}
+
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
